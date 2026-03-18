@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textinput"
@@ -37,6 +38,8 @@ const (
 	zoneFileTree      = "filetree"
 	zoneSearchResults = "searchresults"
 	zoneDiffViewer    = "diffviewer"
+	zoneHelp          = "help"
+	zoneHeader        = "header"
 
 	// Sidebar resize detection threshold in pixels.
 	sidebarGrabThreshold = 2
@@ -76,6 +79,11 @@ type mainModel struct {
 	sideBySide        bool
 	help              help.Model
 	helpOpen          bool
+	messageOpen       bool
+	messageVp         viewport.Model
+	preamble          string
+	commitBranch      string
+	cachedMeta        commitMeta
 }
 
 func New(input string, cfg config.Config) mainModel {
@@ -132,12 +140,36 @@ func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case key.Matches(msg, keys.ToggleHelp):
 			m.helpOpen = !m.helpOpen
+			m.messageOpen = false
 			return m, tea.Batch(cmds...)
-		case m.helpOpen && (key.Matches(msg, keys.Quit) || msg.Key().Code == tea.KeyEscape):
+		case key.Matches(msg, keys.ToggleMessage):
+			if m.preamble != "" {
+				m.messageOpen = !m.messageOpen
+				m.helpOpen = false
+				if m.messageOpen {
+					m.updateMessageVp()
+					m.messageVp.GotoTop()
+				}
+			}
+			return m, tea.Batch(cmds...)
+		case (m.helpOpen || m.messageOpen) && (key.Matches(msg, keys.Quit) || msg.Key().Code == tea.KeyEscape):
 			m.helpOpen = false
+			m.messageOpen = false
 			return m, tea.Batch(cmds...)
-		case m.helpOpen:
-			// Block all other keys while help is open
+		case m.messageOpen && key.Matches(msg, keys.Down):
+			m.messageVp.ScrollDown(1)
+			return m, tea.Batch(cmds...)
+		case m.messageOpen && key.Matches(msg, keys.CtrlD):
+			m.messageVp.ScrollDown(m.messageVp.Height() / 2)
+			return m, tea.Batch(cmds...)
+		case m.messageOpen && key.Matches(msg, keys.Up):
+			m.messageVp.ScrollUp(1)
+			return m, tea.Batch(cmds...)
+		case m.messageOpen && key.Matches(msg, keys.CtrlU):
+			m.messageVp.ScrollUp(m.messageVp.Height() / 2)
+			return m, tea.Batch(cmds...)
+		case m.helpOpen || m.messageOpen:
+			// Block all other keys while an overlay is open
 			return m, tea.Batch(cmds...)
 		case key.Matches(msg, keys.Quit):
 			return m, tea.Quit
@@ -231,6 +263,9 @@ func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.fileTree.SetSize(tWidth, tHeight)
 		m.search.SetWidth(m.searchWidth())
+		if m.messageOpen {
+			m.updateMessageVp()
+		}
 
 	case fileTreeMsg:
 		m.files = msg.files
@@ -238,7 +273,10 @@ func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		m.fileTree = m.fileTree.SetFiles(m.files)
-		m.diffViewer.SetPreamble(strings.TrimSpace(msg.preamble))
+		m.preamble = strings.TrimSpace(msg.preamble)
+		m.commitBranch = msg.branch
+		m.cachedMeta = m.parseCommitMeta()
+		m.diffViewer.SetPreamble(m.preamble)
 		m.diffViewer, cmd = m.diffViewer.SetDirPatch("/", m.fileTree.GetCurrNodeDesendantDiffs())
 		cmds = append(cmds, cmd)
 
@@ -248,7 +286,7 @@ func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	// Route messages: key messages go only to active panel, other messages go to both.
-	// Exception: ctrl+d/ctrl+u always go to diffViewer for scrolling.
+	// Exception: ctrl+d/ctrl+u go to diffViewer for scrolling (unless an overlay is open).
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -422,11 +460,7 @@ func (m mainModel) View() tea.View {
 	var sections []string
 
 	if !m.config.UI.HideHeader {
-		header := lipgloss.NewStyle().Width(m.width).
-			Foreground(lipgloss.Color("6")).
-			Bold(true).
-			Render("DIFFNAV")
-		sections = append(sections, header)
+		sections = append(sections, m.viewHeader())
 	}
 
 	sections = append(sections, separator)
@@ -442,18 +476,13 @@ func (m mainModel) View() tea.View {
 	}
 
 	if m.helpOpen {
-		helpView := m.help.View()
-		s := lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder(), true).
-			Padding(1, 3).
-			BorderForeground(lipgloss.Blue)
-		row := m.height/4 - 2 // just a bit above the center
-		col := m.width / 2
-		col -= lipgloss.Width(helpView) / 2
-		layers = append(
-			layers,
-			lipgloss.NewLayer(s.Render(helpView)).X(col).Y(row),
-		)
+		o := m.renderOverlay(m.help.View())
+		layers = append(layers, lipgloss.NewLayer(o.rendered).X(o.col).Y(o.row))
+	}
+
+	if m.messageOpen {
+		o := m.renderOverlay(m.messageViewContent())
+		layers = append(layers, lipgloss.NewLayer(o.rendered).X(o.col).Y(o.row))
 	}
 
 	comp := lipgloss.NewCompositor(layers...)
@@ -466,6 +495,7 @@ func (m mainModel) View() tea.View {
 type fileTreeMsg struct {
 	files    []*gitdiff.File
 	preamble string
+	branch   string
 }
 
 func (m mainModel) fetchFileTree() tea.Msg {
@@ -476,7 +506,206 @@ func (m mainModel) fetchFileTree() tea.Msg {
 	}
 	sortFiles(files)
 
-	return fileTreeMsg{files: files, preamble: preamble}
+	branch := resolveBranch(preamble)
+	return fileTreeMsg{files: files, preamble: preamble, branch: branch}
+}
+
+func relativeTime(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "now"
+	case d < time.Hour:
+		m := int(d.Minutes())
+		return fmt.Sprintf("%dm", m)
+	case d < 24*time.Hour:
+		h := int(d.Hours())
+		return fmt.Sprintf("%dh", h)
+	case d < 30*24*time.Hour:
+		days := int(d.Hours() / 24)
+		return fmt.Sprintf("%dD", days)
+	case d < 365*24*time.Hour:
+		months := int(d.Hours() / 24 / 30)
+		return fmt.Sprintf("%dM", months)
+	default:
+		years := int(d.Hours() / 24 / 365)
+		return fmt.Sprintf("%dY", years)
+	}
+}
+
+// resolveBranch finds branches pointing at the preamble commit.
+func resolveBranch(preamble string) string {
+	// Check for decoration in commit line: "commit abc123 (HEAD -> branch)"
+	for _, line := range strings.Split(preamble, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "commit ") {
+			if idx := strings.Index(trimmed, " ("); idx > 0 {
+				refs := trimmed[idx+2:]
+				if end := strings.Index(refs, ")"); end > 0 {
+					refs = refs[:end]
+				}
+				for _, ref := range strings.Split(refs, ",") {
+					ref = strings.TrimSpace(ref)
+					if strings.HasPrefix(ref, "HEAD -> ") {
+						return strings.TrimPrefix(ref, "HEAD -> ")
+					}
+				}
+			}
+			// Extract hash for --points-at lookup.
+			hash := strings.TrimPrefix(trimmed, "commit ")
+			if idx := strings.Index(hash, " "); idx > 0 {
+				hash = hash[:idx]
+			}
+			if hash == "" {
+				return ""
+			}
+			out, err := exec.Command("git", "branch", "--points-at", hash).Output()
+			if err != nil {
+				return ""
+			}
+			for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				b := strings.TrimLeft(l, " *+")
+				if b != "" {
+					return b
+				}
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+type commitMeta struct {
+	hash   string
+	date   string
+	author string
+}
+
+func (m mainModel) parseCommitMeta() commitMeta {
+	var meta commitMeta
+	if m.preamble == "" {
+		return meta
+	}
+	for _, line := range strings.Split(m.preamble, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "commit ") && meta.hash == "" {
+			h := strings.TrimPrefix(trimmed, "commit ")
+			// Strip refs decoration if present: "abc123 (HEAD -> branch)"
+			if idx := strings.Index(h, " ("); idx > 0 {
+				h = h[:idx]
+			}
+			if len(h) > 7 {
+				h = h[:7]
+			}
+			meta.hash = h
+		}
+		if strings.HasPrefix(trimmed, "Author:") && meta.author == "" {
+			a := strings.TrimPrefix(trimmed, "Author:")
+			a = strings.TrimSpace(a)
+			if idx := strings.Index(a, " <"); idx > 0 {
+				a = a[:idx]
+			} else if strings.HasPrefix(a, "<") && strings.Contains(a, "@") {
+				// No name, only email: extract username from <user@example.com>
+				a = strings.TrimPrefix(a, "<")
+				if idx := strings.Index(a, "@"); idx > 0 {
+					a = a[:idx]
+				}
+			}
+			parts := strings.Fields(a)
+			if len(parts) >= 2 {
+				meta.author = string([]rune(parts[0])[:1]) + parts[len(parts)-1]
+			} else {
+				meta.author = a
+			}
+		}
+		if meta.date == "" {
+			for _, prefix := range []string{"AuthorDate:", "Date:"} {
+				if strings.HasPrefix(trimmed, prefix) {
+					raw := strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+					if t, err := time.Parse("Mon Jan 2 15:04:05 2006 -0700", raw); err == nil {
+						meta.date = relativeTime(t)
+					}
+					break
+				}
+			}
+		}
+	}
+	return meta
+}
+
+func (m mainModel) commitSubject() string {
+	if m.preamble == "" {
+		return ""
+	}
+	for _, line := range strings.Split(m.preamble, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		// Skip metadata lines (commit hash, Author:, Date:, Merge:, etc.)
+		if strings.HasPrefix(trimmed, "commit ") ||
+			strings.HasPrefix(trimmed, "Author:") ||
+			strings.HasPrefix(trimmed, "AuthorDate:") ||
+			strings.HasPrefix(trimmed, "Date:") ||
+			strings.HasPrefix(trimmed, "Commit:") ||
+			strings.HasPrefix(trimmed, "CommitDate:") ||
+			strings.HasPrefix(trimmed, "Merge:") {
+			continue
+		}
+		return trimmed
+	}
+	return ""
+}
+
+func (m mainModel) viewHeader() string {
+	title := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("6")).
+		Bold(true).
+		Render("DIFFNAV")
+
+	sep := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Render(" • ")
+	hashStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("132"))
+	dateStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("172"))
+	authorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
+	refStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("072"))
+
+	headerParts := title
+	meta := m.cachedMeta
+	if meta.hash != "" {
+		// Build info segment: hash date author
+		var infoParts []string
+		infoParts = append(infoParts, hashStyle.Render(meta.hash))
+		if meta.date != "" {
+			infoParts = append(infoParts, dateStyle.Render(meta.date))
+		}
+		if meta.author != "" {
+			infoParts = append(infoParts, authorStyle.Render(meta.author))
+		}
+		headerParts = headerParts + sep + strings.Join(infoParts, " ")
+
+		// Branch ref.
+		if m.commitBranch != "" {
+			branchLabel := "[" + m.commitBranch + "]"
+			if m.iconStyle != filenode.IconsASCII && m.iconStyle != filenode.IconsUnicode {
+				branchLabel = "\ue0a0 " + m.commitBranch
+			}
+			headerParts = headerParts + sep + refStyle.Render(branchLabel)
+		}
+
+		// Commit subject.
+		subject := m.commitSubject()
+		if subject != "" {
+			maxSubjectWidth := m.width - lipgloss.Width(headerParts) - 2
+			if maxSubjectWidth > 0 {
+				subject = utils.TruncateString(subject, maxSubjectWidth)
+				headerParts = headerParts + " " + subject
+			}
+		}
+	}
+
+	return lipgloss.NewStyle().Width(m.width).Render(
+		zone.Mark(zoneHeader, headerParts),
+	)
 }
 
 func (m mainModel) footerView() string {
@@ -484,14 +713,90 @@ func (m mainModel) footerView() string {
 	files := fmt.Sprintf(" %d files", len(m.files))
 	sep := lipgloss.NewStyle().Foreground(lipgloss.BrightBlack).Render(" • ")
 	added, deleted := m.diffViewer.RootDiffStats()
-	help := base.Background(lipgloss.BrightBlack).PaddingLeft(1).PaddingRight(1).Render("F1/? help")
+	help := zone.Mark(zoneHelp, base.Background(lipgloss.BrightBlack).PaddingLeft(1).PaddingRight(1).Render("F1/? help"))
 	stats := filenode.ViewDiffStats(added, deleted, base)
-	spacing := base.Render(strings.Repeat(" ", max(0, m.width-lipgloss.Width(stats)-
-		lipgloss.Width(help)-lipgloss.Width(files)-lipgloss.Width(sep))))
+
+	left := lipgloss.JoinHorizontal(lipgloss.Top, files, sep, stats)
+	rightWidth := lipgloss.Width(help)
+
+	spacing := base.Render(strings.Repeat(" ", max(0, m.width-lipgloss.Width(left)-rightWidth)))
 	return base.
 		Width(m.width).
 		Height(1).
-		Render(lipgloss.JoinHorizontal(lipgloss.Top, files, sep, stats, spacing, help))
+		Render(lipgloss.JoinHorizontal(lipgloss.Top, left, spacing, help))
+}
+
+func (m *mainModel) messageView() string {
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	yellow := lipgloss.NewStyle().Foreground(lipgloss.Yellow)
+
+	var out []string
+
+	// Render preamble lines.
+	for _, line := range strings.Split(m.preamble, "\n") {
+		switch {
+		case strings.HasPrefix(line, "commit "):
+			out = append(out, dim.Render("commit ")+yellow.Render(strings.TrimPrefix(line, "commit ")))
+		case strings.HasPrefix(line, "Author:"),
+			strings.HasPrefix(line, "AuthorDate:"),
+			strings.HasPrefix(line, "Date:"),
+			strings.HasPrefix(line, "Commit:"),
+			strings.HasPrefix(line, "CommitDate:"),
+			strings.HasPrefix(line, "Merge:"):
+			out = append(out, dim.Render(line))
+		default:
+			out = append(out, line)
+		}
+	}
+
+	return strings.Join(out, "\n")
+}
+
+func (m *mainModel) updateMessageVp() {
+	s := overlayStyle()
+	maxWidth := min(m.width*3/4, 80)
+	maxHeight := m.height/2 - s.GetVerticalFrameSize()
+	if maxHeight < 5 {
+		maxHeight = 5
+	}
+	content := lipgloss.NewStyle().Width(maxWidth).Render(m.messageView())
+	m.messageVp.SetWidth(maxWidth)
+	m.messageVp.SetHeight(maxHeight)
+	m.messageVp.SetContent(content)
+}
+
+func (m mainModel) renderScrollbar() string {
+	trackHeight := m.messageVp.Height()
+	totalLines := m.messageVp.TotalLineCount()
+	viewHeight := m.messageVp.Height()
+
+	// Thumb size proportional to visible portion.
+	thumbSize := max(1, trackHeight*viewHeight/totalLines)
+	// Thumb position based on scroll offset.
+	scrollableLines := totalLines - viewHeight
+	thumbPos := 0
+	if scrollableLines > 0 {
+		thumbPos = m.messageVp.YOffset() * (trackHeight - thumbSize) / scrollableLines
+		if m.messageVp.YOffset() > 0 && thumbPos == 0 {
+			thumbPos = 1
+		}
+	}
+
+	track := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	thumb := lipgloss.NewStyle().Foreground(lipgloss.Blue)
+
+	var sb strings.Builder
+	for i := 0; i < trackHeight; i++ {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		if i >= thumbPos && i < thumbPos+thumbSize {
+			sb.WriteString(thumb.Render("┃"))
+		} else {
+			sb.WriteString(track.Render("│"))
+		}
+	}
+	return sb.String()
 }
 
 func (m mainModel) resultsView() string {
@@ -567,7 +872,78 @@ func (m mainModel) openInEditor() tea.Cmd {
 	})
 }
 
+// messageViewContent returns the message overlay content (viewport + optional scrollbar).
+func (m mainModel) messageViewContent() string {
+	vpView := m.messageVp.View()
+	if m.messageVp.TotalLineCount() > m.messageVp.Height() {
+		vpView = lipgloss.JoinHorizontal(lipgloss.Top, vpView, " ", m.renderScrollbar())
+	}
+	return vpView
+}
+
+// overlayStyle returns the shared style for overlay panels (help, message).
+func overlayStyle() lipgloss.Style {
+	return lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder(), true).
+		Padding(1, 3).
+		BorderForeground(lipgloss.Blue)
+}
+
+type overlayResult struct {
+	rendered     string
+	col, row     int
+	width, height int
+}
+
+// renderOverlay renders content with the overlay style and returns the
+// rendered string and its position.
+func (m mainModel) renderOverlay(content string) overlayResult {
+	rendered := overlayStyle().Render(content)
+	w := lipgloss.Width(rendered)
+	h := lipgloss.Height(rendered)
+	return overlayResult{
+		rendered: rendered,
+		col:      max(0, m.width/2-w/2),
+		row:      max(0, m.height/4-2),
+		width:    w,
+		height:   h,
+	}
+}
+
 func (m mainModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	// Handle overlays: scroll or click-outside-to-close.
+	if m.messageOpen || m.helpOpen {
+		switch msg := msg.(type) {
+		case tea.MouseClickMsg:
+			if msg.Button == tea.MouseLeft {
+				var content string
+				if m.messageOpen {
+					content = m.messageViewContent()
+				} else {
+					content = m.help.View()
+				}
+				o := m.renderOverlay(content)
+				if msg.X < o.col || msg.X >= o.col+o.width || msg.Y < o.row || msg.Y >= o.row+o.height {
+					// Click outside: close overlay.
+					m.messageOpen = false
+					m.helpOpen = false
+					return m, nil
+				}
+				return m, nil
+			}
+			return m, nil // Block non-left clicks while overlay is open
+		default:
+			if m.messageOpen {
+				if msg.Mouse().Button == tea.MouseWheelDown {
+					m.messageVp.ScrollDown(scrollLines)
+				} else if msg.Mouse().Button == tea.MouseWheelUp {
+					m.messageVp.ScrollUp(scrollLines)
+				}
+			}
+			return m, nil
+		}
+	}
+
 	// Handle scroll wheel first.
 	if msg.Mouse().Button == tea.MouseWheelUp || msg.Mouse().Button == tea.MouseWheelDown {
 		return m.handleScroll(msg)
@@ -598,6 +974,20 @@ func (m mainModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			if !m.searching && zone.Get(zoneFileTree).InBounds(msg) {
 				return m.handleFileTreeClick(msg)
+			}
+			if zone.Get(zoneHelp).InBounds(msg) {
+				m.helpOpen = !m.helpOpen
+				m.messageOpen = false
+				return m, nil
+			}
+			if zone.Get(zoneHeader).InBounds(msg) && m.preamble != "" {
+				m.messageOpen = !m.messageOpen
+				m.helpOpen = false
+				if m.messageOpen {
+					m.updateMessageVp()
+					m.messageVp.GotoTop()
+				}
+				return m, nil
 			}
 		}
 
